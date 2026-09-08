@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Deriv Digit Analysis Tool</title>
+<style>
+  :root { --bg:#0a0e17; --card:#131a2a; --border:#1e2a44; --text:#e2e8f0;
+          --muted:#7c8db0; --green:#22c55e; --red:#ef4444; --blue:#3b82f6; }
+  * { box-sizing:border-box; margin:0; padding:0; font-family:system-ui,sans-serif; }
+  body { background:var(--bg); color:var(--text); padding:24px; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:12px; }
+  h1 { font-size:1.3rem; }
+  select, button { background:var(--card); color:var(--text); border:1px solid var(--border);
+                   padding:8px 14px; border-radius:8px; font-size:0.95rem; cursor:pointer; }
+  .status { font-size:0.85rem; color:var(--muted); }
+  .status.live { color:var(--green); }
+  .price { font-size:1.6rem; font-variant-numeric:tabular-nums; }
+  .up { color:var(--green); } .down { color:var(--red); }
+  .tickstrip { display:flex; gap:6px; margin:16px 0; flex-wrap:wrap; }
+  .tickstrip span { background:var(--card); border:1px solid var(--border); border-radius:6px;
+                    padding:6px 10px; font-variant-numeric:tabular-nums; font-weight:600; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
+  .card h2 { font-size:0.95rem; color:var(--muted); margin-bottom:12px; text-transform:uppercase; letter-spacing:.05em; }
+  .bars { display:flex; flex-direction:column; gap:4px; }
+  .barrow { display:flex; align-items:center; gap:8px; font-variant-numeric:tabular-nums; }
+  .barrow .lbl { width:16px; text-align:center; color:var(--muted); }
+  .barrow .track { flex:1; height:18px; background:var(--bg); border-radius:4px; overflow:hidden; }
+  .barrow .fill { height:100%; background:var(--blue); border-radius:4px; transition:width .3s; }
+  .barrow.top .fill { background:var(--green); }
+  .barrow.bot .fill { background:var(--red); }
+  .barrow .pct { width:48px; text-align:right; font-size:.85rem; }
+  .split { display:flex; gap:12px; margin-top:4px; }
+  .split div { flex:1; text-align:center; padding:12px; border-radius:8px; background:var(--bg); }
+  .split .big { font-size:1.5rem; font-weight:700; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  td.num { font-variant-numeric:tabular-nums; }
+  .note { color:var(--muted); font-size:.8rem; margin-top:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Deriv Digit Analysis</h1>
+  <div>
+    <select id="market"></select>
+    <span class="status" id="status">connecting…</span>
+  </div>
+</header>
+
+<div class="card">
+  <div class="price" id="price">—</div>
+  <div class="status" id="lastDigit">last digit: —</div>
+</div>
+
+<div class="tickstrip" id="strip"></div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Digit frequency (last 100 ticks)</h2>
+    <div class="bars" id="digitBars"></div>
+    <p class="note">Green = most frequent, red = least frequent in the current window. Descriptive statistics only — digits are independent per tick.</p>
+  </div>
+  <div class="card">
+    <h2>Even / Odd · Over 5 / Under 4 (last 100)</h2>
+    <div class="split">
+      <div><div class="big" id="evenPct">—</div>Even</div>
+      <div><div class="big" id="oddPct">—</div>Odd</div>
+    </div>
+    <div class="split" style="margin-top:12px">
+      <div><div class="big" id="overPct">—</div>Over 5</div>
+      <div><div class="big" id="underPct">—</div>Under 4</div>
+    </div>
+  </div>
+  <div class="card" style="grid-column:1/-1">
+    <h2>All 13 synthetic markets</h2>
+    <table id="overview">
+      <thead><tr><th>Market</th><th>Last price</th><th>Last digit</th><th>Change (last 100)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"; // Deriv public app_id
+const MARKETS = ["R_10","R_25","R_50","R_75","R_100","1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V","JD10","JD5","JDG5"];
+const WINDOW = 100;
+let ws, reqId = 1, pending = {};
+let current = "R_100";
+const ticks = {};            // symbol -> [{price, digit}]
+const feeds = {};            // symbol -> subscription id
+
+const sel = document.getElementById("market");
+MARKETS.forEach(m => { const o = document.createElement("option"); o.value = o.textContent = m; sel.appendChild(o); });
+sel.value = current;
+sel.onchange = () => switchMarket(sel.value);
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => { setStatus("live"); subscribeAll(); };
+  ws.onclose = () => { setStatus("disconnected — retrying"); setTimeout(connect, 3000); };
+  ws.onmessage = e => handle(JSON.parse(e.data));
+}
+const setStatus = (t, live=false) => { const s = document.getElementById("status"); s.textContent = t; s.className = "status" + (live ? " live" : ""); };
+const send = obj => { obj.req_id = reqId; ws.send(JSON.stringify(obj)); return reqId++; };
+
+function subscribeAll() {
+  MARKETS.forEach(sym => {
+    const id = send({ ticks_history: sym, count: WINDOW, end: "latest", style: "ticks", subscribe: 1 });
+    pending[id] = sym;
+  });
+}
+
+function handle(msg) {
+  if (msg.req_id && pending[msg.req_id]) {       // history snapshot
+    const sym = pending[msg.req_id]; delete pending[msg.req_id];
+    ticks[sym] = msg.history.prices.map(p => ({ price: p, digit: lastDigit(p) }));
+    feeds[sym] = msg.subscription.id;
+    if (sym === current) render();
+    renderOverview();
+  } else if (msg.tick) {                          // live tick
+    const sym = msg.tick.symbol;
+    if (!ticks[sym]) return;
+    ticks[sym].push({ price: msg.tick.quote, digit: lastDigit(msg.tick.quote) });
+    if (ticks[sym].length > WINDOW) ticks[sym].shift();
+    if (sym === current) { renderPrice(msg.tick); render(); }
+    renderOverview();
+  }
+}
+const lastDigit = p => { const s = p.toString(); return +s[s.length - 1] || 0; };
+
+function switchMarket(sym) {
+  current = sym; render();
+}
+
+function renderPrice(tick) {
+  const el = document.getElementById("price");
+  el.textContent = tick.quote.toFixed(4);
+  const prev = ticks[current].at(-2)?.price ?? tick.quote;
+  el.className = "price " + (tick.quote >= prev ? "up" : "down");
+  document.getElementById("lastDigit").textContent = "last digit: " + tick.display_value.slice(-1);
+}
+
+function render() {
+  const data = ticks[current] || [];
+  document.getElementById("strip").innerHTML =
+    data.slice(-12).map(t => `<span>${t.digit}</span>`).join("");
+  const freq = Array(10).fill(0);
+  data.forEach(t => freq[t.digit]++);
+  const max = Math.max(...freq, 1);
+  const top = freq.indexOf(Math.max(...freq));
+  const bot = freq.indexOf(Math.min(...freq.filter(f => f > 0)));
+  const n = data.length || 1;
+  document.getElementById("digitBars").innerHTML = freq.map((f, d) =>
+    `<div class="barrow ${d===top?'top':''} ${d===bot?'bot':''}">
+       <div class="lbl">${d}</div>
+       <div class="track"><div class="fill" style="width:${(f/max)*100}%"></div></div>
+       <div class="pct">${((f/n)*100).toFixed(0)}%</div>
+     </div>`).join("");
+  const even = data.filter(t => t.digit % 2 === 0).length;
+  const over = data.filter(t => t.digit > 5).length;
+  document.getElementById("evenPct").textContent = ((even/n)*100).toFixed(0) + "%";
+  document.getElementById("oddPct").textContent  = (((n-even)/n)*100).toFixed(0) + "%";
+  document.getElementById("overPct").textContent = ((over/n)*100).toFixed(0) + "%";
+  document.getElementById("underPct").textContent= (((n-over)/n)*100).toFixed(0) + "%";
+}
+
+function renderOverview() {
+  document.querySelector("#overview tbody").innerHTML = MARKETS.map(sym => {
+    const d = ticks[sym]; if (!d || d.length < 2) return "";
+    const last = d.at(-1), first = d[0];
+    const chg = ((last.price - first.price) / first.price * 100);
+    return `<tr><td>${sym}</td><td class="num">${last.price.toFixed(4)}</td>
+            <td class="num">${last.digit}</td>
+            <td class="num ${chg>=0?'up':'down'}">${chg.toFixed(3)}%</td></tr>`;
+  }).join("");
+}
+
+connect();
+</script>
+</body>
+</html>
